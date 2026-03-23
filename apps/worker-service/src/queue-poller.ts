@@ -4,42 +4,30 @@ import type { AnalysisRequestedEvent } from '@senior-challenge/shared-types';
 import type { MessageProcessor } from './processors/processor.interface';
 
 const QUEUE_DIR = path.join(process.cwd(), 'local-queue');
+const FAILED_DIR = path.join(process.cwd(), 'failed-records');
 const POLL_INTERVAL_MS = 1000;
 
-/**
- * Queue Poller - simulates SQS polling for local development.
- * In production, this would use AWS SQS SDK.
- */
 export class QueuePoller {
     private isRunning = false;
 
     constructor(private readonly processor: MessageProcessor) { }
 
-    /**
-     * Starts the polling loop.
-     */
     async start(): Promise<void> {
-        console.log('📡 Queue poller started, watching: ' + QUEUE_DIR);
-
-        // Ensure queue directory exists
-        if (!fs.existsSync(QUEUE_DIR)) {
-            fs.mkdirSync(QUEUE_DIR, { recursive: true });
+        for (const dir of [QUEUE_DIR, FAILED_DIR]) {
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
         }
 
+        console.log(`[QueuePoller] Started, watching: ${QUEUE_DIR}`);
         this.isRunning = true;
         await this.pollLoop();
     }
 
-    /**
-     * Stops the polling loop.
-     */
     stop(): void {
         this.isRunning = false;
     }
 
-    /**
-     * Main polling loop.
-     */
     private async pollLoop(): Promise<void> {
         while (this.isRunning) {
             try {
@@ -51,24 +39,45 @@ export class QueuePoller {
                     try {
                         const content = fs.readFileSync(filepath, 'utf-8');
                         const event: AnalysisRequestedEvent = JSON.parse(content);
+                        const tag = `[jobId=${event.jobId} traceId=${event.traceId ?? 'N/A'}]`;
 
-                        console.log(`📨 Processing message: ${event.jobId}`);
+                        console.log(`${tag} Dequeued message from ${file}`);
 
                         await this.processor.process(event);
 
-                        // Delete file after successful processing
                         fs.unlinkSync(filepath);
-                        console.log(`✅ Message processed and deleted: ${file}`);
+                        console.log(`${tag} Message processed and deleted: ${file}`);
                     } catch (error) {
-                        console.log('Error processing message'); // ⚠️ BUG: 没有有用的错误信息
-                        // Move to failed? For now, just skip
+                        const errMsg = error instanceof Error ? error.message : String(error);
+                        console.error(
+                            `[QueuePoller] Error processing file=${file}: ${errMsg}`,
+                            error,
+                        );
+                        this.moveToFailed(filepath, file, error);
                     }
                 }
             } catch (error) {
-                console.log('Error in poll loop'); // ⚠️ BUG: 糟糕的日志
+                const errMsg = error instanceof Error ? error.message : String(error);
+                console.error(`[QueuePoller] Poll loop error: ${errMsg}`, error);
             }
 
             await this.sleep(POLL_INTERVAL_MS);
+        }
+    }
+
+    private moveToFailed(filepath: string, filename: string, error: unknown): void {
+        try {
+            const failedPath = path.join(FAILED_DIR, `${Date.now()}-${filename}`);
+            const content = fs.existsSync(filepath) ? fs.readFileSync(filepath, 'utf-8') : '{}';
+            const failedRecord = {
+                originalMessage: JSON.parse(content),
+                error: error instanceof Error ? error.message : String(error),
+                failedAt: new Date().toISOString(),
+            };
+            fs.writeFileSync(failedPath, JSON.stringify(failedRecord, null, 2));
+            if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
+        } catch {
+            console.error(`[QueuePoller] Could not move ${filename} to failed-records/`);
         }
     }
 

@@ -4,74 +4,99 @@ import type { MessageProcessor } from './processor.interface';
 
 const MONGODB_URI = process.env.MONGODB_URI ?? 'mongodb://localhost:27017/analysis_db';
 
-/**
- * Analysis Processor - processes analysis jobs from the queue.
- *
- * ⚠️ 警告：这段代码存在多个问题！
- * 1. 也在写入 demographics，与 LegacyApp 冲突
- * 2. 没有处理第三方 API 数据格式错误
- * 3. 日志非常糟糕，无法追踪问题
- */
 export class AnalysisProcessor implements MessageProcessor {
     private connection: mongoose.Connection | null = null;
 
-    constructor() {
-        this.initializeDatabase();
-    }
-
-    private async initializeDatabase(): Promise<void> {
+    async ensureConnected(): Promise<void> {
+        if (this.connection?.readyState === 1) return;
         try {
             await mongoose.connect(MONGODB_URI);
             this.connection = mongoose.connection;
-            console.log('Connected to MongoDB'); // ⚠️ BUG: 应该用结构化日志
+            console.log('[AnalysisProcessor] Connected to MongoDB');
         } catch (error) {
-            console.log('DB connection failed'); // ⚠️ BUG: 没有错误详情
+            console.error('[AnalysisProcessor] DB connection failed', error);
+            throw error;
         }
     }
 
-    /**
-     * Processes an analysis request.
-     *
-     * ⚠️ BUG: 这个方法也在写入 demographics，
-     * 但 LegacyApp 的 delayedUpdate 可能会覆盖这里的结果！
-     */
     async process(event: AnalysisRequestedEvent): Promise<void> {
-        const { jobId, dataUrl } = event;
+        const { jobId, traceId } = event;
+        const tag = `[jobId=${jobId} traceId=${traceId ?? 'N/A'}]`;
 
-        console.log('Processing job: ' + jobId); // ⚠️ BUG: 没有结构化日志
+        console.log(`${tag} Processing started`);
+
+        await this.ensureConnected();
 
         try {
-            // 更新状态为 PROCESSING
-            await this.updateJobStatus(jobId, 'PROCESSING');
+            const job = await this.findJob(jobId);
+            if (!job) {
+                console.error(`${tag} Job not found in DB, skipping`);
+                return;
+            }
 
-            // 模拟调用第三方 API
-            const apiResponse = await this.callThirdPartyApi(dataUrl);
+            if (job.status !== 'PENDING') {
+                console.warn(`${tag} Job status is ${job.status}, expected PENDING — skipping duplicate`);
+                return;
+            }
 
-            // ⚠️ BUG: 没有验证 API 响应格式！
-            // 如果 apiResponse.data 格式不对，这里会崩溃
-            const demographics = this.transformApiResponse(apiResponse);
+            const currentVersion = job.version ?? 1;
 
-            // ⚠️ BUG: 无条件写入，可能被 LegacyApp 的 delayedUpdate 覆盖
-            await this.updateJobWithResults(jobId, demographics);
+            const updated = await this.updateJobVersioned(
+                jobId,
+                { status: 'PROCESSING' },
+                currentVersion,
+            );
+            if (!updated) {
+                console.warn(`${tag} Version conflict when setting PROCESSING — skipping duplicate`);
+                return;
+            }
 
-            console.log('Job completed: ' + jobId); // ⚠️ BUG: 没有结构化日志
+            const apiResponse = await this.callThirdPartyApi(event.dataUrl);
+
+            if (!apiResponse.success || !apiResponse.data) {
+                const reason = apiResponse.error ?? 'API returned success=false or empty data';
+                console.error(`${tag} Third-party API failure: ${reason}`);
+                await this.updateJobVersioned(
+                    jobId,
+                    { status: 'FAILED', error: reason },
+                    currentVersion + 1,
+                );
+                return;
+            }
+
+            const demographics = this.transformApiResponse(apiResponse, tag);
+
+            const completed = await this.updateJobVersioned(
+                jobId,
+                {
+                    status: 'COMPLETED',
+                    demographics,
+                    completedAt: new Date().toISOString(),
+                },
+                currentVersion + 1,
+            );
+
+            if (!completed) {
+                console.warn(`${tag} Version conflict when setting COMPLETED`);
+                return;
+            }
+
+            console.log(`${tag} Processing completed successfully`);
         } catch (error) {
-            console.log('Error happened'); // ⚠️ BUG: 没有任何有用信息！
-            await this.updateJobStatus(jobId, 'FAILED');
+            const errMsg = error instanceof Error ? error.message : String(error);
+            console.error(`${tag} Processing failed: ${errMsg}`, error);
+            try {
+                await this.forceUpdateStatus(jobId, 'FAILED', errMsg);
+            } catch (dbErr) {
+                console.error(`${tag} Failed to mark job as FAILED in DB`, dbErr);
+            }
         }
     }
 
-    /**
-     * Simulates calling a third-party API.
-     * Returns "dirty" data with various format issues.
-     */
     private async callThirdPartyApi(dataUrl: string): Promise<ThirdPartyApiResponse> {
-        // 模拟 API 延迟
         await new Promise((resolve) => setTimeout(resolve, 500 + Math.random() * 1000));
 
-        // 模拟各种脏数据场景
         const scenarios: ThirdPartyApiResponse[] = [
-            // 正常数据
             {
                 success: true,
                 data: {
@@ -83,7 +108,6 @@ export class AnalysisProcessor implements MessageProcessor {
                     score: 0.85,
                 },
             },
-            // ⚠️ 脏数据：age 是字符串
             {
                 success: true,
                 data: {
@@ -91,11 +115,10 @@ export class AnalysisProcessor implements MessageProcessor {
                     gender: 'male',
                     country: 'UK',
                     city: null,
-                    tags: 'lifestyle,food', // ⚠️ 应该是数组，但返回了字符串
-                    score: '0.72', // ⚠️ 应该是数字，但返回了字符串
+                    tags: 'lifestyle,food',
+                    score: '0.72',
                 },
             },
-            // ⚠️ 脏数据：缺少关键字段
             {
                 success: true,
                 data: {
@@ -109,34 +132,63 @@ export class AnalysisProcessor implements MessageProcessor {
             },
         ];
 
-        // 随机返回一种场景
         return scenarios[Math.floor(Math.random() * scenarios.length)];
     }
 
     /**
-     * Transforms API response to Demographics.
-     *
-     * ⚠️ BUG: 没有类型校验！如果字段格式不对，会崩溃或产生错误数据
+     * Robust transformer that handles all dirty-data variants the
+     * third-party API may return without crashing.
      */
-    private transformApiResponse(response: ThirdPartyApiResponse): Demographics {
+    private transformApiResponse(response: ThirdPartyApiResponse, tag: string): Demographics {
         const data = response.data!;
 
-        // ⚠️ BUG: 直接使用，没有校验类型
-        // 如果 data.age 是 "25+" 字符串，这里会有问题
-        // 如果 data.tags 是逗号分隔的字符串而不是数组，这里会有问题
-        return {
-            ageRange: this.calculateAgeRange(data.age as number), // ⚠️ 危险的类型断言！
-            gender: data.gender as string,
-            location: data.country as string,
-            interests: data.tags as string[], // ⚠️ 可能是字符串，不是数组！
-            confidence: data.score as number,
-        };
+        const ageRange = this.safeParseAgeRange(data.age, tag);
+        const gender = typeof data.gender === 'string' ? data.gender : 'unknown';
+        const location = typeof data.country === 'string' ? data.country : 'unknown';
+
+        let interests: string[] | undefined;
+        if (Array.isArray(data.tags)) {
+            interests = data.tags;
+        } else if (typeof data.tags === 'string') {
+            interests = data.tags.split(',').map((t: string) => t.trim()).filter(Boolean);
+        }
+
+        let confidence: number | undefined;
+        if (typeof data.score === 'number' && isFinite(data.score)) {
+            confidence = Math.min(1, Math.max(0, data.score));
+        } else if (typeof data.score === 'string') {
+            const parsed = parseFloat(data.score);
+            if (isFinite(parsed)) {
+                confidence = Math.min(1, Math.max(0, parsed));
+            }
+        }
+
+        return { ageRange, gender, location, interests, confidence };
     }
 
-    /**
-     * Calculates age range from a numeric age.
-     * ⚠️ BUG: 如果传入的不是数字（比如 "25+"），会返回 undefined
-     */
+    private safeParseAgeRange(age: unknown, tag: string): string {
+        if (age === null || age === undefined) {
+            console.warn(`${tag} age is missing, defaulting to 'unknown'`);
+            return 'unknown';
+        }
+
+        if (typeof age === 'number' && isFinite(age) && age >= 0) {
+            return this.calculateAgeRange(age);
+        }
+
+        if (typeof age === 'string') {
+            const num = parseInt(age, 10);
+            if (isFinite(num) && num >= 0) {
+                return this.calculateAgeRange(num);
+            }
+            console.warn(`${tag} age is non-numeric string "${age}", using as-is`);
+            return age;
+        }
+
+        console.warn(`${tag} age has unexpected type ${typeof age}, defaulting to 'unknown'`);
+        return 'unknown';
+    }
+
     private calculateAgeRange(age: number): string {
         if (age < 18) return 'under-18';
         if (age < 25) return '18-24';
@@ -146,30 +198,36 @@ export class AnalysisProcessor implements MessageProcessor {
         return '55+';
     }
 
-    private async updateJobStatus(jobId: string, status: string): Promise<void> {
+    private getCollection() {
         const collection = this.connection?.collection('analysis_jobs');
-        if (!collection) return;
-
-        await collection.updateOne(
-            { jobId },
-            { $set: { status, updatedAt: new Date().toISOString() } },
-        );
+        if (!collection) throw new Error('Database not connected');
+        return collection;
     }
 
-    private async updateJobWithResults(jobId: string, demographics: Demographics): Promise<void> {
-        const collection = this.connection?.collection('analysis_jobs');
-        if (!collection) return;
+    private async findJob(jobId: string): Promise<AnalysisJob | null> {
+        const doc = await this.getCollection().findOne({ jobId });
+        return doc as unknown as AnalysisJob | null;
+    }
 
-        await collection.updateOne(
-            { jobId },
+    private async updateJobVersioned(
+        jobId: string,
+        updates: Partial<AnalysisJob>,
+        expectedVersion: number,
+    ): Promise<boolean> {
+        const result = await this.getCollection().updateOne(
+            { jobId, version: expectedVersion },
             {
-                $set: {
-                    status: 'COMPLETED',
-                    demographics,
-                    updatedAt: new Date().toISOString(),
-                    completedAt: new Date().toISOString(),
-                },
+                $set: { ...updates, updatedAt: new Date().toISOString() },
+                $inc: { version: 1 },
             },
+        );
+        return result.matchedCount > 0;
+    }
+
+    private async forceUpdateStatus(jobId: string, status: string, error: string): Promise<void> {
+        await this.getCollection().updateOne(
+            { jobId },
+            { $set: { status, error, updatedAt: new Date().toISOString() } },
         );
     }
 }

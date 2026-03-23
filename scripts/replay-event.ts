@@ -1,29 +1,51 @@
-/**
- * Replay Event Script
- *
- * 🎯 任务：实现这个脚本，使其能够从 debug-payloads/ 目录读取 JSON 文件，
- * 并直接调用 Worker 的处理逻辑（绕过消息队列）。
- *
- * 用法：pnpm run replay -- --file=debug-payloads/job-xxx.json
- *
- * TODO: 候选人需要实现以下功能：
- * 1. 解析命令行参数获取文件路径
- * 2. 读取 JSON 文件内容
- * 3. 初始化 AnalysisProcessor
- * 4. 调用 processor.process(event)
- * 5. 输出处理结果
- */
+import * as fs from 'fs';
+import * as path from 'path';
+import { AnalysisProcessor } from '../apps/worker-service/src/processors/analysis.processor';
+import type { AnalysisRequestedEvent } from '../packages/shared-types/src/types';
 
-console.log('🚧 This script is not implemented yet!');
-console.log('📝 Your task: Implement the replay functionality.');
-console.log('');
-console.log('Hint: You should be able to run:');
-console.log('  pnpm run replay -- --file=debug-payloads/job-xxx.json');
-console.log('');
-console.log('And it should:');
-console.log('  1. Read the JSON file');
-console.log('  2. Call AnalysisProcessor.process() directly');
-console.log('  3. Show the processing logs');
-console.log('  4. NOT require the queue poller to be running');
+async function main(): Promise<void> {
+    const fileArg = process.argv.find((a) => a.startsWith('--file='));
+    if (!fileArg) {
+        console.error('Usage: pnpm run replay -- --file=debug-payloads/job-xxx.json');
+        process.exit(1);
+    }
 
-process.exit(1);
+    const filePath = path.resolve(process.cwd(), fileArg.split('=')[1]);
+    if (!fs.existsSync(filePath)) {
+        console.error(`File not found: ${filePath}`);
+        process.exit(1);
+    }
+
+    const content = fs.readFileSync(filePath, 'utf-8');
+    let event: AnalysisRequestedEvent;
+    try {
+        event = JSON.parse(content);
+    } catch {
+        console.error(`Invalid JSON in ${filePath}`);
+        process.exit(1);
+    }
+
+    if (!event.jobId || !event.eventType) {
+        console.error('File does not contain a valid AnalysisRequestedEvent (missing jobId or eventType)');
+        process.exit(1);
+    }
+
+    console.log(`[Replay] Loading event from: ${filePath}`);
+    console.log(`[Replay] jobId=${event.jobId} traceId=${event.traceId ?? 'N/A'}`);
+    console.log(`[Replay] --- Begin processing ---`);
+
+    const processor = new AnalysisProcessor();
+    await processor.ensureConnected();
+
+    const start = Date.now();
+    await processor.process(event);
+    const elapsed = Date.now() - start;
+
+    console.log(`[Replay] --- Finished in ${elapsed}ms ---`);
+    process.exit(0);
+}
+
+main().catch((error) => {
+    console.error('[Replay] Fatal error:', error);
+    process.exit(1);
+});

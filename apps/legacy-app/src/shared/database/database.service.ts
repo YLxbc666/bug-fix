@@ -4,10 +4,6 @@ import type { AnalysisJob } from '@senior-challenge/shared-types';
 
 const MONGODB_URI = process.env.MONGODB_URI ?? 'mongodb://localhost:27017/analysis_db';
 
-/**
- * Database service for MongoDB operations.
- * ⚠️ 简化版实现，生产环境请使用 NestJS Mongoose 模块
- */
 @Injectable()
 export class DatabaseService implements OnModuleInit {
     private readonly logger = new Logger(DatabaseService.name);
@@ -17,54 +13,64 @@ export class DatabaseService implements OnModuleInit {
         try {
             await mongoose.connect(MONGODB_URI);
             this.connection = mongoose.connection;
-            this.logger.log('✅ Connected to MongoDB');
+            this.logger.log('Connected to MongoDB');
         } catch (error) {
-            this.logger.error('❌ Failed to connect to MongoDB', error);
+            this.logger.error('Failed to connect to MongoDB', error);
             throw error;
         }
     }
 
-    /**
-     * Saves an analysis job to the database.
-     */
-    async saveJob(job: AnalysisJob): Promise<void> {
+    private getCollection() {
         const collection = this.connection?.collection('analysis_jobs');
         if (!collection) {
             throw new Error('Database not connected');
         }
+        return collection;
+    }
+
+    async saveJob(job: AnalysisJob): Promise<void> {
+        const collection = this.getCollection();
+        const jobWithVersion = { ...job, version: 1 };
 
         await collection.updateOne(
             { jobId: job.jobId },
-            { $set: job },
+            { $set: jobWithVersion },
             { upsert: true },
         );
     }
 
-    /**
-     * Finds an analysis job by ID.
-     */
     async findJobById(jobId: string): Promise<AnalysisJob | null> {
-        const collection = this.connection?.collection('analysis_jobs');
-        if (!collection) {
-            throw new Error('Database not connected');
-        }
-
+        const collection = this.getCollection();
         const doc = await collection.findOne({ jobId });
         return doc as unknown as AnalysisJob | null;
     }
 
     /**
-     * Updates specific fields of an analysis job.
+     * Optimistic-lock update: only succeeds when the current document
+     * version matches `expectedVersion`. Increments version on success.
+     * Returns true if the update was applied.
      */
-    async updateJob(jobId: string, updates: Partial<AnalysisJob>): Promise<void> {
-        const collection = this.connection?.collection('analysis_jobs');
-        if (!collection) {
-            throw new Error('Database not connected');
-        }
+    async updateJobWithVersion(
+        jobId: string,
+        updates: Partial<AnalysisJob>,
+        expectedVersion: number,
+    ): Promise<boolean> {
+        const collection = this.getCollection();
 
-        await collection.updateOne(
-            { jobId },
-            { $set: { ...updates, updatedAt: new Date().toISOString() } },
+        const result = await collection.updateOne(
+            { jobId, version: expectedVersion },
+            {
+                $set: { ...updates, updatedAt: new Date().toISOString() },
+                $inc: { version: 1 },
+            },
         );
+
+        if (result.matchedCount === 0) {
+            this.logger.warn(
+                `Optimistic lock conflict for job ${jobId}: expected version ${expectedVersion}`,
+            );
+            return false;
+        }
+        return true;
     }
 }
