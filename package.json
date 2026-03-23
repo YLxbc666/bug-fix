@@ -16,6 +16,8 @@
         "replay": "tsx scripts/replay-event.ts",
         "process:chaos": "tsx scripts/process-chaos.ts",
         "simulate:audience-bug": "tsx apps/worker-service/src/audience-integration/run-audience-test.ts",
+        "test:part4": "tsx scripts/test-part4-audience-bug.ts",
+        "test:part4:e2e": "tsx scripts/test-part4-audience-bug.ts --e2e",
         "test": "pnpm -r test",
         "lint": "pnpm -r lint"
     },

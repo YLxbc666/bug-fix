@@ -1,16 +1,84 @@
 /**
  * Facade Service - 包装第三方 Audience API 调用
  * 
- * 模拟真实的 facade-upfluence.service.ts 逻辑：
- * - 使用 Playwright browser context
- * - Auth management
- * - 错误处理
- * 
- * 🐛 核心 BUG: 数据提取逻辑对不同的响应格式处理不当
+ * 使用 Playwright browser context 调用第三方 Audience API。
+ * 支持两种 API 响应格式：新格式 (data.audience) 和老格式 (audience_data.demographics)。
  */
 
 import { chromium, Browser, BrowserContext } from 'playwright';
 import { MockAuthPool } from './mock-auth-pool';
+
+/** New API response format: { status, data: { audience: { gender, age, geography } } } */
+interface NewFormatResponse {
+    status: string;
+    data: {
+        audience: {
+            gender?: Array<{ label: string; value: number }>;
+            age?: Array<{ label: string; value: number }>;
+            geography?: {
+                countries?: Array<{ name: string; code: string; percentage: number }>;
+            };
+        };
+        meta?: {
+            media_id: string;
+            platform: string;
+            last_updated: string;
+        };
+    };
+}
+
+/** Legacy API response format: { status, audience_data: { demographics: { gender, ... } } } */
+interface LegacyFormatResponse {
+    status: string;
+    audience_data: {
+        demographics: {
+            gender?: Array<{ label: string; value: number }>;
+            age?: Array<{ label: string; value: number }>;
+            geography?: {
+                countries?: Array<{ name: string; code: string; percentage: number }>;
+            };
+        };
+    };
+}
+
+/** Normalized audience data returned by the facade */
+interface NormalizedAudienceData {
+    gender?: Array<{ label: string; value: number }>;
+    age?: Array<{ label: string; value: number }>;
+    geography?: any;
+}
+
+export type AudienceApiResponse = NewFormatResponse | LegacyFormatResponse;
+
+export function isNewFormat(response: AudienceApiResponse): response is NewFormatResponse {
+    return 'data' in response && response.data != null && 'audience' in response.data;
+}
+
+export function isLegacyFormat(response: AudienceApiResponse): response is LegacyFormatResponse {
+    return 'audience_data' in response && response.audience_data != null;
+}
+
+/**
+ * Extract audience data from either API response format into a normalized shape.
+ */
+export function extractAudienceData(response: AudienceApiResponse): NormalizedAudienceData | null {
+    if (isNewFormat(response)) {
+        console.log('[FacadeService] Detected new API response format');
+        return response.data.audience;
+    }
+
+    if (isLegacyFormat(response)) {
+        console.log('[FacadeService] Detected legacy API response format, normalizing...');
+        const demographics = response.audience_data.demographics;
+        return {
+            gender: demographics.gender,
+            age: demographics.age,
+            geography: demographics.geography,
+        };
+    }
+
+    return null;
+}
 
 export class FacadeAudienceService {
     private authPool: MockAuthPool;
@@ -20,39 +88,29 @@ export class FacadeAudienceService {
         this.authPool = new MockAuthPool();
     }
 
-    /**
-     * 获取 Audience 数据
-     * 
-     * @param mediaType - instagram | tiktok
-     * @param mediaId - 媒体ID
-     * @param context - 可选的共享浏览器上下文
-     */
     async getAudienceV1ByPlaywright(
         mediaType: 'instagram' | 'tiktok',
         mediaId: string,
         context?: BrowserContext,
-    ): Promise<any> {
+    ): Promise<NormalizedAudienceData | null> {
         const url = `http://localhost:3001/api/v1/audience?media_type=${mediaType}&media_id=${mediaId}`;
 
+        let browser: Browser | null = null;
+        let shouldCloseBrowser = false;
+
         try {
-            // 获取认证
             const auth = await this.authPool.getNextAuth();
             const token = await this.authPool.getToken(auth);
 
             console.log(`[FacadeService] Fetching audience for ${mediaType}:${mediaId}`);
             console.log(`[FacadeService] Using auth: ${auth.username}`);
 
-            let browser: Browser | null = null;
-            let shouldCloseBrowser = false;
-
-            // 如果没有提供 context，创建新的
             if (!context) {
                 browser = await chromium.launch({ headless: true });
                 context = await browser.newContext();
                 shouldCloseBrowser = true;
             }
 
-            // 发起请求
             const response = await context.request.get(url, {
                 headers: {
                     'authorization': `Bearer ${token}`,
@@ -62,66 +120,65 @@ export class FacadeAudienceService {
 
             const audienceData = await response.json();
 
-            // 🐛 BUG核心：数据提取逻辑
-            // 预期路径: data.audience.gender
-            // 但是对于 mediaId=12345，结构是 audience_data.demographics.gender
-            // 这里只处理了"新"格式，没有处理"老"格式
             if (audienceData.status !== 'success') {
-                console.error('[FacadeService] API returned non-success status');
+                console.error(`[FacadeService] API returned non-success status: ${audienceData.status}`);
                 return null;
             }
 
-            console.log('[FacadeService] Raw response:', JSON.stringify(audienceData).substring(0, 200));
+            console.log('[FacadeService] Raw response:', JSON.stringify(audienceData).substring(0, 300));
 
-            /*
-             * 🐛 这里是问题所在！
-             * 如果 API 返回的是老格式（audience_data），这里就会返回 undefined
-             * 因为代码只检查了新格式（data.audience）
-             */
-            const extracted = audienceData.data?.audience;
+            const extracted = extractAudienceData(audienceData as AudienceApiResponse);
 
             if (!extracted) {
-                // 这是候选人会看到的日志
-                console.error('[FacadeService] ⚠️ Audience data is NULL - why??');
+                console.error('[FacadeService] Could not extract audience data from response');
                 console.error('[FacadeService] Available keys:', Object.keys(audienceData));
+                return null;
             }
 
-            if (shouldCloseBrowser && browser) {
-                await browser.close();
-            }
-
+            console.log(`[FacadeService] Successfully extracted audience data for ${mediaType}:${mediaId}`);
             return extracted;
 
         } catch (error) {
-            console.error('[FacadeService] Failed to fetch audience:', (error as Error).message);
+            console.error(`[FacadeService] Failed to fetch audience for ${mediaType}:${mediaId}:`, (error as Error).message);
             throw error;
+        } finally {
+            if (shouldCloseBrowser && browser) {
+                await browser.close();
+            }
         }
     }
 
-    /**
-     * 批量获取 - 模拟真实场景中的并发问题
-     */
     async batchGetAudience(requests: Array<{ mediaType: 'instagram' | 'tiktok'; mediaId: string }>) {
         console.log(`[FacadeService] Batch fetching ${requests.length} audience datasets`);
 
-        // 🐛 BUG场景: 并发调用时可能重用同一个 auth
-        // 真实场景中应该共享 browser context 来减少开销
+        let browser: Browser | null = null;
+        let context: BrowserContext | null = null;
 
-        const results = await Promise.all(
-            requests.map(req =>
-                this.getAudienceV1ByPlaywright(req.mediaType, req.mediaId)
-            )
-        );
+        try {
+            browser = await chromium.launch({ headless: true });
+            context = await browser.newContext();
 
-        const successCount = results.filter(r => r !== null).length;
-        console.log(`[FacadeService] Batch complete: ${successCount}/${requests.length} succeeded`);
+            const results = await Promise.all(
+                requests.map(req =>
+                    this.getAudienceV1ByPlaywright(req.mediaType, req.mediaId, context!)
+                )
+            );
 
-        return results;
+            const successCount = results.filter(r => r !== null).length;
+            console.log(`[FacadeService] Batch complete: ${successCount}/${requests.length} succeeded`);
+
+            return results;
+        } finally {
+            if (browser) {
+                await browser.close();
+            }
+        }
     }
 
     async cleanup() {
         if (this.sharedBrowser) {
             await this.sharedBrowser.close();
+            this.sharedBrowser = null;
         }
     }
 }
